@@ -201,7 +201,10 @@ public final class LibreLoopPairingService {
             sessionBox.set(session)
 
             onStage(.handshaking)
-            let transport = SensorSessionTransport(session: session)
+            let transport = DisconnectGuardedTransport(
+                base: SensorSessionTransport(session: session),
+                box: sessionBox
+            )
 
             // Cached/direct reconnect is the ONLY viable BLE path for an
             // already-active sensor. If it fails we deliberately do NOT fall back
@@ -420,7 +423,10 @@ public final class LibreLoopPairingService {
             //   - maxEntropyAttempts: 1
             //   - Phase 5 entropy = nativeEphemeral.nullEntropy11A
             onStage(.handshaking)
-            let transport = SensorSessionTransport(session: session)
+            let transport = DisconnectGuardedTransport(
+                base: SensorSessionTransport(session: session),
+                box: sessionBox
+            )
             let phoneCert = try Self.loadFirstPairCert()
             let nativeEphemeral = try SessionKey.makeFirstPairNativeEphemeral(
                 entropySource: Self.secureRandomBytes(count:)
@@ -684,6 +690,51 @@ public final class LibreLoopPairingService {
             lock.lock(); defer { lock.unlock() }
             return value
         }
+        private var disconnected = false
+        func markDisconnected() {
+            lock.lock(); defer { lock.unlock() }
+            disconnected = true
+        }
+        var isDisconnected: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return disconnected
+        }
+    }
+
+    /// Refuses pairing I/O once the watchdog has seen a disconnect.
+    /// handleDisconnect only fails operations already in flight, so an
+    /// operation started after the drop -- e.g. the Phase 5 write, which
+    /// follows a long synchronous key derivation -- would otherwise go to
+    /// a dead peripheral and sit out its timeout.
+    struct DisconnectGuardedTransport: CommandPairingTransport {
+        let base: any CommandPairingTransport
+        let box: SessionBox
+
+        private func ensureConnected() throws {
+            if box.isDisconnected {
+                throw Failure.underlying("Sensor disconnected during handshake")
+            }
+        }
+
+        func write(_ message: Data, to characteristic: BleCharRef) async throws {
+            try ensureConnected()
+            try await base.write(message, to: characteristic)
+        }
+
+        func awaitNotify(on characteristic: BleCharRef, exactly n: Int) async throws -> Data {
+            try ensureConnected()
+            return try await base.awaitNotify(on: characteristic, exactly: n)
+        }
+
+        func writeCommand(_ command: UInt8) async throws {
+            try ensureConnected()
+            try await base.writeCommand(command)
+        }
+
+        func awaitCommandResponse(timeout: TimeInterval) async throws -> Data {
+            try ensureConnected()
+            return try await base.awaitCommandResponse(timeout: timeout)
+        }
     }
 
     /// Run an operation against a session built mid-flight, failing
@@ -711,6 +762,7 @@ public final class LibreLoopPairingService {
                     // any operation is in flight on it, this makes
                     // their pending CheckedContinuations throw
                     // SensorSessionError.disconnected.
+                    box.markDisconnected()
                     box.get()?.handleDisconnect(error: err)
                     return
                 }
