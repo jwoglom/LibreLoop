@@ -395,76 +395,81 @@ public final class LibreLoopPairingService {
 
         let sensor = try await Self.scanForAnyPeripheralNG(scanner: scanner, timeout: 120)
 
-        onStage(.bleConnecting)
-        let session: SensorSession
-        do {
-            session = try await Self.connectAndBuildSession(
-                scanner: scanner,
-                peripheral: sensor.peripheral,
-                timeout: 120
+        return try await Self.withDisconnectWatchdog(scanner: scanner, peripheralID: sensor.peripheral.identifier) { sessionBox in
+            onStage(.bleConnecting)
+            let session: SensorSession
+            do {
+                session = try await Self.connectAndBuildSession(
+                    scanner: scanner,
+                    peripheral: sensor.peripheral,
+                    timeout: 120
+                )
+            } catch {
+                throw Failure.underlying("BLE connection failed: \(error.localizedDescription)")
+            }
+            // Hand the session to the watchdog so a .didDisconnect fails
+            // the handshake's pending BLE ops, as reconnect() does.
+            sessionBox.set(session)
+
+            // 3. Handshake -- candidate path with phone_cert_162b (03 03 family).
+            //
+            // phone_cert_firstpair (the 03 00 default) has known live-sensor
+            // rejection, so we use phone_cert_162b and follow the PoC's candidate
+            // Phase 5 flow:
+            //   - native ephemeral derived via SessionKey.makeFirstPairNativeEphemeral
+            //   - maxEntropyAttempts: 1
+            //   - Phase 5 entropy = nativeEphemeral.nullEntropy11A
+            onStage(.handshaking)
+            let transport = SensorSessionTransport(session: session)
+            let phoneCert = try Self.loadFirstPairCert()
+            let nativeEphemeral = try SessionKey.makeFirstPairNativeEphemeral(
+                entropySource: Self.secureRandomBytes(count:)
             )
-        } catch {
-            throw Failure.underlying("BLE connection failed: \(error.localizedDescription)")
-        }
+            let pairingFlow = PairingFlow(
+                transport: transport,
+                phoneCert: phoneCert,
+                phoneEph: nativeEphemeral.keyPair,
+                eventLogger: { message in llog(message) }
+            )
 
-        // 3. Handshake -- candidate path with phone_cert_162b (03 03 family).
-        //
-        // phone_cert_firstpair (the 03 00 default) has known live-sensor
-        // rejection, so we use phone_cert_162b and follow the PoC's candidate
-        // Phase 5 flow:
-        //   - native ephemeral derived via SessionKey.makeFirstPairNativeEphemeral
-        //   - maxEntropyAttempts: 1
-        //   - Phase 5 entropy = nativeEphemeral.nullEntropy11A
-        onStage(.handshaking)
-        let transport = SensorSessionTransport(session: session)
-        let phoneCert = try Self.loadFirstPairCert()
-        let nativeEphemeral = try SessionKey.makeFirstPairNativeEphemeral(
-            entropySource: Self.secureRandomBytes(count:)
-        )
-        let pairingFlow = PairingFlow(
-            transport: transport,
-            phoneCert: phoneCert,
-            phoneEph: nativeEphemeral.keyPair,
-            eventLogger: { message in llog(message) }
-        )
+            let handshake: FirstPairDerivedHandshakeResult
+            do {
+                handshake = try await pairingFlow.runCommandGatedFirstPairHandshake(
+                    blePIN: activation.blePIN,
+                    maxEntropyAttempts: 1,
+                    entropySource: { requestedCount in
+                        guard requestedCount == nativeEphemeral.nullEntropy11A.count else {
+                            throw Failure.underlying(
+                                "Entropy size mismatch (need \(requestedCount), have \(nativeEphemeral.nullEntropy11A.count))"
+                            )
+                        }
+                        return nativeEphemeral.nullEntropy11A
+                    },
+                    r2Provider: { try Self.secureRandomBytes(count: 16) }
+                )
+            } catch {
+                throw Failure.underlying("Pairing handshake failed: \(error.localizedDescription)")
+            }
 
-        let handshake: FirstPairDerivedHandshakeResult
-        do {
-            handshake = try await pairingFlow.runCommandGatedFirstPairHandshake(
+            let material = handshake.handshake.sessionMaterial
+            let result = Result(
+                receiverID: receiverID,
+                sensorSerial: scanResult.patchInfo.serialNumber,
+                bleAddress: activation.bleAddressDisplay,
                 blePIN: activation.blePIN,
-                maxEntropyAttempts: 1,
-                entropySource: { requestedCount in
-                    guard requestedCount == nativeEphemeral.nullEntropy11A.count else {
-                        throw Failure.underlying(
-                            "Entropy size mismatch (need \(requestedCount), have \(nativeEphemeral.nullEntropy11A.count))"
-                        )
-                    }
-                    return nativeEphemeral.nullEntropy11A
-                },
-                r2Provider: { try Self.secureRandomBytes(count: 16) }
+                activatedAt: nfcResponse.activatedAt ?? Date(),
+                kEnc: material.kEnc,
+                ivEnc: material.ivEnc,
+                phase5RawKey: handshake.phase5Material.rawKey
             )
-        } catch {
-            throw Failure.underlying("Pairing handshake failed: \(error.localizedDescription)")
+            let monitor = try LibreLoopSensorMonitor.make(
+                scanner: scanner,
+                session: session,
+                kEnc: material.kEnc,
+                ivEnc: material.ivEnc
+            )
+            return PairOutcome(result: result, monitor: monitor, peripheralID: sensor.id)
         }
-
-        let material = handshake.handshake.sessionMaterial
-        let result = Result(
-            receiverID: receiverID,
-            sensorSerial: scanResult.patchInfo.serialNumber,
-            bleAddress: activation.bleAddressDisplay,
-            blePIN: activation.blePIN,
-            activatedAt: nfcResponse.activatedAt ?? Date(),
-            kEnc: material.kEnc,
-            ivEnc: material.ivEnc,
-            phase5RawKey: handshake.phase5Material.rawKey
-        )
-        let monitor = try LibreLoopSensorMonitor.make(
-            scanner: scanner,
-            session: session,
-            kEnc: material.kEnc,
-            ivEnc: material.ivEnc
-        )
-        return PairOutcome(result: result, monitor: monitor, peripheralID: sensor.id)
     }
 
     private static func ensureRuntimeTables() async throws {
